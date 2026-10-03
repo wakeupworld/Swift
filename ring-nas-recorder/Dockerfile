@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Base image pinned by digest; bump digest and package versions together
 # (docker buildx imagetools inspect node:22-alpine3.24, apk policy <pkg>).
 ARG NODE_IMAGE=node:22-alpine3.24@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
@@ -31,7 +30,8 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
-COPY --chmod=0555 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0555 /usr/local/bin/docker-entrypoint.sh
 
 # 568 = TrueNAS SCALE "apps" user/group.
 USER 568:568
