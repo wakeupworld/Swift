@@ -43,6 +43,7 @@ export function inSchedule(windows, date = new Date()) {
 export function loadConfig(env = process.env) {
   const config = {
     refreshToken: env.RING_REFRESH_TOKEN?.trim() || '',
+    refreshTokenFile: env.RING_REFRESH_TOKEN_FILE || '/run/secrets/ring_refresh_token',
     dataDir: env.DATA_DIR || '/data',
     recordingsDir: env.RECORDINGS_DIR || '/recordings',
     cameraFilter: list(env.CAMERAS),
@@ -53,7 +54,8 @@ export function loadConfig(env = process.env) {
     continuousCameras: list(env.CONTINUOUS_CAMERAS),
     continuousSchedule: parseSchedule(env.CONTINUOUS_SCHEDULE),
     segmentSeconds: int(env.SEGMENT_SECONDS, 300, 'SEGMENT_SECONDS'),
-    retentionDays: int(env.RETENTION_DAYS, 0, 'RETENTION_DAYS'),
+    retentionDays: int(env.RETENTION_DAYS, 30, 'RETENTION_DAYS'),
+    minFreeGb: int(env.MIN_FREE_GB, 5, 'MIN_FREE_GB'),
     minClipBytes: int(env.MIN_CLIP_BYTES, 50000, 'MIN_CLIP_BYTES'),
     dryRun: bool(env.DRY_RUN),
     mock: bool(env.MOCK),
@@ -69,6 +71,7 @@ export function loadConfig(env = process.env) {
   if (config.clipSeconds < 5 || config.clipSeconds > 600) throw new Error('CLIP_SECONDS must be 5-600')
   // Ring ends live sessions after ~10 minutes regardless of what the client asks for.
   if (config.segmentSeconds < 30 || config.segmentSeconds > 590) throw new Error('SEGMENT_SECONDS must be 30-590')
+  if (config.retentionDays < 0 || config.minFreeGb < 0) throw new Error('RETENTION_DAYS and MIN_FREE_GB must be >= 0')
   if (config.maxConcurrentStreams < 1) throw new Error('MAX_CONCURRENT_STREAMS must be >= 1')
   return config
 }

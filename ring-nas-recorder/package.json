@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/index.js",
     "auth": "ring-auth-cli",
-    "test": "node --test"
+    "test": "node --test",
+    "audit": "node scripts/audit-check.mjs"
   },
   "engines": {
     "node": ">=20"
@@ -18,6 +19,6 @@
   "license": "MIT",
   "dependencies": {
     "ring-client-api": "14.3.0",
-    "rxjs": "^7.8.2"
+    "rxjs": "7.8.2"
   }
 }

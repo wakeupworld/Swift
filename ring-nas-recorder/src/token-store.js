@@ -1,6 +1,10 @@
+import fs from 'node:fs/promises'
 import path from 'node:path'
 import { readFileIfExists, writeFileAtomic } from './fs-utils.js'
 import { log } from './log.js'
+import { registerSecret } from './redact.js'
+
+const TOKEN_MODE = 0o600
 
 // Ring refresh tokens are single-use: every auth returns a new one and the old
 // one stops working, so the latest token must survive container restarts.
@@ -9,20 +13,34 @@ export class TokenStore {
     this.file = path.join(dataDir, 'refresh-token')
   }
 
-  async load(envToken) {
-    const saved = (await readFileIfExists(this.file))?.trim()
-    if (saved) {
-      log.info(`Using refresh token persisted in ${this.file}`)
-      return saved
+  async #readRestricted(file) {
+    const token = (await readFileIfExists(file))?.trim()
+    if (!token) return undefined
+    const { mode } = await fs.stat(file)
+    if (mode & 0o077) {
+      log.warn(`${file} is accessible to other users (mode ${(mode & 0o777).toString(8)}), tightening to 600`)
+      await fs.chmod(file, TOKEN_MODE).catch((err) => log.warn(`chmod failed: ${err.message}`))
     }
-    if (envToken) {
-      log.info('Using refresh token from RING_REFRESH_TOKEN (first run)')
-      return envToken
+    return token
+  }
+
+  // Order: rotated token in /data, then a bootstrap secret file, then (discouraged) env var.
+  async load({ bootstrapFile, envToken }) {
+    let token = await this.#readRestricted(this.file)
+    if (token) {
+      log.info(`Using refresh token from ${this.file}`)
+    } else if (bootstrapFile && (token = (await readFileIfExists(bootstrapFile))?.trim())) {
+      log.info(`Using bootstrap refresh token from ${bootstrapFile}`)
+    } else if (envToken) {
+      token = envToken
+      log.warn('Using RING_REFRESH_TOKEN from the environment; prefer the `auth` command or a secret file')
     }
-    return undefined
+    registerSecret(token)
+    return token
   }
 
   async save(token) {
-    await writeFileAtomic(this.file, `${token}\n`, 0o600)
+    registerSecret(token)
+    await writeFileAtomic(this.file, `${token}\n`, TOKEN_MODE)
   }
 }

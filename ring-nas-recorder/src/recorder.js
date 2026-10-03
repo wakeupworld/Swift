@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { firstValueFrom } from 'rxjs'
-import { clipPath } from './fs-utils.js'
+import { DIR_MODE, clipPath } from './fs-utils.js'
 import { log } from './log.js'
 
 class Semaphore {
@@ -31,8 +31,9 @@ class Semaphore {
 }
 
 export class Recorder {
-  constructor(config) {
+  constructor(config, storage) {
     this.config = config
+    this.storage = storage
     this.streams = new Semaphore(config.maxConcurrentStreams)
     this.busy = new Set()
     this.lastEnded = new Map()
@@ -81,7 +82,11 @@ export class Recorder {
         log.info(`[${camera.name}] DRY_RUN: would record ${seconds}s ${kind} clip to ${finalPath}`)
         return finalPath
       }
-      await fs.mkdir(path.dirname(finalPath), { recursive: true })
+      if (!(await this.storage.ensureFreeSpace())) {
+        log.error(`[${camera.name}] ${kind} skipped: less than MIN_FREE_GB free on ${this.config.recordingsDir}`)
+        return undefined
+      }
+      await fs.mkdir(path.dirname(finalPath), { recursive: true, mode: DIR_MODE })
       log.info(`[${camera.name}] ${kind}: starting ${seconds}s live recording`)
       await this.#stream(camera, seconds, partPath)
 

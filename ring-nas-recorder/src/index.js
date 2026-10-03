@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises'
 import { RingApi } from 'ring-client-api'
+import { useLogger } from 'ring-client-api/util'
 import { inSchedule, loadConfig } from './config.js'
 import { log } from './log.js'
 import { MockRingApi } from './mock.js'
 import { Recorder } from './recorder.js'
-import { applyRetention } from './retention.js'
+import { Storage } from './storage.js'
 import { TokenStore } from './token-store.js'
+import { DIR_MODE } from './fs-utils.js'
+
+// Clips 0640, folders 0750: readable by the app group (e.g. an SMB viewers group), never world-readable.
+process.umask(0o027)
 
 const config = loadConfig()
 log.debugEnabled = config.debug
+useLogger({ logInfo: (...m) => log.debug(...m), logError: (m) => log.error(m) })
 
 async function createApi(refreshToken) {
   if (config.mock) {
@@ -56,24 +62,39 @@ async function continuousLoop(camera, recorder, stopping) {
   }
 }
 
+async function assertWritable(dir) {
+  const probe = `${dir}/.write-test-${process.pid}`
+  try {
+    await fs.writeFile(probe, '')
+    await fs.rm(probe)
+  } catch (err) {
+    const uid = process.getuid?.()
+    const gid = process.getgid?.()
+    log.error(`UID ${uid} / GID ${gid} cannot write to ${dir} (${err.code}).`)
+    log.error('Grant that user/group Modify on the dataset or share mounted there (see README, Permissions).')
+    process.exit(1)
+  }
+}
+
 async function main() {
-  await fs.mkdir(config.dataDir, { recursive: true })
-  await fs.mkdir(config.recordingsDir, { recursive: true })
+  for (const dir of [config.dataDir, config.recordingsDir]) {
+    await fs.mkdir(dir, { recursive: true, mode: DIR_MODE })
+    await assertWritable(dir)
+  }
 
   const tokens = new TokenStore(config.dataDir)
-  const refreshToken = await tokens.load(config.refreshToken)
+  const refreshToken = await tokens.load({ bootstrapFile: config.refreshTokenFile, envToken: config.refreshToken })
   if (!refreshToken) {
-    log.error(
-      'No refresh token. Generate one with `docker compose run --rm ring-nas-recorder auth` ' +
-        'and set RING_REFRESH_TOKEN (only needed for the first start).',
-    )
+    log.error(`No refresh token. Run the interactive login once; it writes ${tokens.file}:`)
+    log.error('  docker run --rm -it --user 568:568 -v <data dataset>:/data ring-nas-recorder:latest auth')
     process.exit(2)
   }
 
   const api = await createApi(refreshToken)
+  let saving = Promise.resolve()
   api.onRefreshTokenUpdated.subscribe(({ newRefreshToken }) => {
-    tokens
-      .save(newRefreshToken)
+    saving = saving
+      .then(() => tokens.save(newRefreshToken))
       .then(() => log.info('Refresh token rotated and saved'))
       .catch((err) => log.error(`Could not persist refresh token: ${err.message}`))
   })
@@ -85,7 +106,8 @@ async function main() {
     process.exit(3)
   }
 
-  const recorder = new Recorder(config)
+  const storage = new Storage(config)
+  const recorder = new Recorder(config, storage)
   const stopping = { value: false }
 
   for (const camera of cameras) {
@@ -119,8 +141,13 @@ async function main() {
   }
   await heartbeat()
   setInterval(heartbeat, 60000)
-  await applyRetention(config.recordingsDir, config.retentionDays)
-  setInterval(() => applyRetention(config.recordingsDir, config.retentionDays).catch((e) => log.error(e.message)), 6 * 3600000)
+  const housekeeping = () =>
+    storage
+      .applyRetention()
+      .then(() => storage.ensureFreeSpace())
+      .catch((e) => log.error(`Housekeeping failed: ${e.message}`))
+  await housekeeping()
+  setInterval(housekeeping, 3600000)
 
   const shutdown = (signal) => {
     if (stopping.value) return
@@ -134,6 +161,8 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'))
   if (config.exitAfterSeconds > 0) setTimeout(() => shutdown('EXIT_AFTER_SECONDS'), config.exitAfterSeconds * 1000)
 }
+
+process.on('unhandledRejection', (err) => log.error(`Unhandled: ${err?.message || err}`))
 
 main().catch((err) => {
   log.error(err?.message || err)
