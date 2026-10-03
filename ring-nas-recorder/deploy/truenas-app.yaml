@@ -1,0 +1,30 @@
+# TrueNAS SCALE 25.10 (Goldeye): Apps > Discover > ⋮ > Install via YAML.
+# Paste this file, adjust the /mnt/... paths and TZ, then Save.
+# Build the image first from the TrueNAS shell (see README, "Build the image").
+services:
+  ring-nas-recorder:
+    image: ring-nas-recorder:latest
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      TZ: America/New_York
+      PUID: "568"
+      PGID: "568"
+      # Read only while /data/refresh-token does not exist; safe to blank out after the first start.
+      RING_REFRESH_TOKEN: "paste-token-from-auth-step"
+      TRIGGERS: motion,ding
+      CLIP_SECONDS: "45"
+      COOLDOWN_SECONDS: "15"
+      MAX_CONCURRENT_STREAMS: "2"
+      CAMERAS: ""
+      CONTINUOUS_CAMERAS: ""
+      CONTINUOUS_SCHEDULE: "off"
+      RETENTION_DAYS: "30"
+    volumes:
+      - /mnt/tank/apps/ring-nas-recorder/data:/data
+      - /mnt/tank/media/ring:/recordings
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

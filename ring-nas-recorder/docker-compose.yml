@@ -1,0 +1,21 @@
+# Generic compose file (any Docker host). For TrueNAS SCALE 25.10 use
+# deploy/truenas-app.yaml with Apps > Discover > Install via YAML instead.
+services:
+  ring-nas-recorder:
+    build: .
+    image: ring-nas-recorder:latest
+    container_name: ring-nas-recorder
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: ${TZ:-America/New_York}
+      PUID: ${PUID:-568}
+      PGID: ${PGID:-568}
+    volumes:
+      - ./data:/data
+      - ${RECORDINGS_HOST_PATH:-./recordings}:/recordings
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
