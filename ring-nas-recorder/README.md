@@ -20,7 +20,9 @@ and records it to MP4 with ffmpeg:
 
 It is built on [`ring-client-api`](https://github.com/dgreif/ring) (the library used by
 homebridge-ring and ring-mqtt), runs as a single small container, and has no other
-dependencies (no MQTT broker, Home Assistant or NVR).
+dependencies (no MQTT broker, Home Assistant or NVR). It runs locked down by default:
+non-root, read-only root filesystem, all capabilities dropped, no published ports,
+and no secrets in the app config. See [Security](#security).
 
 ## Read this first: limitations of live-stream recording
 
@@ -36,13 +38,11 @@ dependencies (no MQTT broker, Home Assistant or NVR).
 
 ## Configuration
 
-All settings are environment variables.
+All settings are environment variables. None of them is secret.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RING_REFRESH_TOKEN` | – | Token from the auth step. Read **only** while `/data/refresh-token` doesn't exist yet. |
 | `TZ` | UTC | Time zone for folder and file names, e.g. `America/Chicago`. |
-| `PUID` / `PGID` | `568` / `568` | User and group the recorder runs as. 568 is TrueNAS's `apps` user. |
 | `CAMERAS` | all | Comma-separated camera names (as in the Ring app, case-insensitive) or ids. |
 | `TRIGGERS` | `motion,ding` | What starts a clip: `motion`, `ding` (doorbells only), or both. Set it to an empty string for continuous-only mode. |
 | `CLIP_SECONDS` | `45` | Length of each event clip (5-600). |
@@ -51,26 +51,33 @@ All settings are environment variables.
 | `CONTINUOUS_CAMERAS` | – | Cameras to record continuously while `CONTINUOUS_SCHEDULE` is active. |
 | `CONTINUOUS_SCHEDULE` | `off` | `off`, `always`, or windows such as `22:00-06:00,12:00-13:00`. Event triggers are paused for those cameras while the window is active. |
 | `SEGMENT_SECONDS` | `300` | Length of each continuous segment (30-590). |
-| `RETENTION_DAYS` | `0` | Delete `.mp4` files older than N days. `0` keeps everything. |
+| `RETENTION_DAYS` | `30` | Delete clips older than N days. `0` keeps everything. |
+| `MIN_FREE_GB` | `5` | Before each recording and hourly, delete the oldest clips until this much space is free. If space still can't be freed, skip recording. `0` disables this. |
 | `MIN_CLIP_BYTES` | `50000` | Discard clips smaller than this (failed or refused streams). |
+| `RING_REFRESH_TOKEN_FILE` | `/run/secrets/ring_refresh_token` | Optional bootstrap token file (Docker secret), read only while `/data/refresh-token` doesn't exist. |
+| `RING_REFRESH_TOKEN` | – | Discouraged fallback for the same purpose; logs a warning. |
 | `DRY_RUN` | `false` | Log what would be recorded without opening streams. |
-| `DEBUG` | `false` | Verbose logging, including from `ring-client-api`. |
+| `DEBUG` | `false` | Verbose logging, including from `ring-client-api`. Tokens are still redacted. |
 | `MOCK` | `false` | Use two simulated cameras and ffmpeg test video instead of Ring. |
 
 Volumes:
 
-- `/data` holds app state: the rotated refresh token (`refresh-token`, mode 600) and a heartbeat file used by the healthcheck. Keep this on persistent storage, because **losing it means generating a new token**.
-- `/recordings` is where the MP4 files go.
+- `/data` is app-private: the rotating refresh token (`refresh-token`, mode 0600) and
+  the healthcheck heartbeat. **Losing it means logging in again.**
+- `/recordings` holds the clips. Folders are created 0750 and files 0640
+  (umask 027).
+
+Retention and the free-space floor only ever delete regular `*.mp4` files inside
+`/recordings`. They never follow symlinks or touch other files. A ZFS **quota** on the
+recordings dataset is still the hard backstop: Datasets > Edit > Quota.
 
 ### Why the token file matters
 
-Ring refresh tokens are single-use. Every time the container authenticates, Ring
-issues a new token, and the old one stops working soon after. The token also carries
-the push-notification registration. The container writes each new token to
-`/data/refresh-token` and prefers that file over `RING_REFRESH_TOKEN`. So you only
-paste a token once, and an old token left in the YAML is harmless. If the log ever
-shows `Refresh token is not valid`, generate a new one with the auth step and delete
-`/data/refresh-token`.
+Ring refresh tokens are single-use. Every authentication returns a new token, and
+the old one stops working soon after. The token also carries the push-notification
+registration. The container writes each new token atomically (temp file, fsync,
+rename, mode 0600) to `/data/refresh-token`. If the log ever shows `Refresh token is
+not valid`, run the login step again.
 
 ---
 
@@ -79,186 +86,259 @@ shows `Refresh token is not valid`, generate a new one with the auth step and de
 These steps target TrueNAS SCALE **25.10 (Goldeye)**, whose apps run on Docker. The
 steps use pool name `tank`; replace it with your pool name.
 
-### 1. Create the datasets
+### 1. Create the datasets and permissions
 
 **Datasets > Add Dataset**:
 
-1. Create `tank/apps/ring-nas-recorder` with **Dataset Preset: Apps**. It will hold
-   the token and state (it becomes `/data`). Create `tank/apps` first if you don't
-   have it.
-2. Create the recordings dataset, e.g. `tank/media/ring` (it becomes `/recordings`).
-   Use **Preset: SMB** if you want to browse the clips from a PC through an SMB
-   share, otherwise **Generic**.
+1. **`tank/apps/ring-nas-recorder`** becomes `/data` and holds the token.
+   Use **Preset: Generic** (POSIX permissions, so the 0600 token mode is enforced).
+   Then open **Permissions > Edit** and set:
+   - User `apps`, Group `apps`
+   - Read/Write/Execute for the user only: mode **700**, nothing for group or other
+   - Tick **Apply User** and **Apply Group**
+2. **`tank/media/ring`** becomes `/recordings`. Use **Preset: SMB** if you want to
+   browse the clips over the network, otherwise Generic. Open **Permissions > Edit**:
+   - NFSv4 ACL (SMB preset): **Add Item**, User `apps`, **Modify**. For viewers, see
+     [SMB access for viewers](#smb-access-for-viewers). Remove any `everyone@` entry
+     with write access. Tick **Apply permissions recursively**, then **Save Access
+     Control List**.
+   - POSIX (Generic preset): owner `apps:apps`, mode **750**, recursive.
+3. Recommended: set a **Quota** on `tank/media/ring` (e.g. 500 GiB) so the recorder
+   can never fill the pool.
 
-### 2. Give the `apps` user (UID/GID 568) write access
+The container runs as 568:568 and has no root privileges, so it cannot fix
+permissions itself. It refuses to start, logging which UID/GID can't write where, if
+either mount isn't writable.
 
-The container runs as 568:568. It refuses to start, with a clear error in the log,
-if it cannot write to `/recordings`.
+### 2. Get the image
 
-- **Recordings dataset**: select `tank/media/ring` > **Permissions > Edit**.
-  - NFSv4 ACL (the SMB preset): **Add Item**, Who = User, User = `apps`,
-    Permissions = **Modify**. Tick **Apply permissions recursively**, then
-    **Save Access Control List**. Your own SMB user keeps its access, so you can
-    still browse and delete clips over the share.
-  - POSIX / Generic: set Owner User = `apps` and Owner Group = `apps`, tick
-    **Apply User / Apply Group / Apply recursively**, then Save.
-- **App dataset**: the Apps preset already grants `apps` access. The container also
-  `chown`s `/data` to 568 on startup. It never `chown`s `/recordings`, so your ACLs
-  stay intact.
-
-### 3. Build the image
-
-Open **System > Shell**, or SSH in as your admin user and prefix the commands with
-`sudo`:
+**Option A (recommended): signed image from GHCR, pinned by digest.** CI builds,
+tests and Trivy-scans every change, then publishes
+`ghcr.io/wakeupworld/ring-nas-recorder` and signs it with cosign (keyless, GitHub
+OIDC). Take the `@sha256:...` digest from the workflow run summary, or from
+**GitHub > Packages > ring-nas-recorder**. If the package is private, make it public
+there, or add GHCR credentials under **Apps > Configuration > Manage Container
+Images**. Optionally verify the signature from any machine with cosign:
 
 ```sh
-mkdir -p /mnt/tank/apps/ring-nas-recorder/build && cd /mnt/tank/apps/ring-nas-recorder/build
-curl -L https://github.com/wakeupworld/Swift/archive/refs/heads/cursor/ring-nas-recorder-088d.tar.gz \
+cosign verify ghcr.io/wakeupworld/ring-nas-recorder@sha256:<digest> \
+  --certificate-identity-regexp '^https://github.com/wakeupworld/Swift/\.github/workflows/ring-nas-recorder\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Then pull it on TrueNAS: `sudo docker pull ghcr.io/wakeupworld/ring-nas-recorder@sha256:<digest>`.
+
+**Option B: build locally** in **System > Shell**:
+
+```sh
+mkdir -p /tmp/rnr && cd /tmp/rnr
+curl -fsSL https://github.com/wakeupworld/Swift/archive/refs/heads/master.tar.gz \
   | tar xz --strip-components=1 --wildcards '*/ring-nas-recorder/'
 sudo docker build -t ring-nas-recorder:latest ./ring-nas-recorder
 ```
 
-After this PR is merged, use `.../archive/refs/heads/master.tar.gz` instead. The
-image is local, so the app YAML uses `pull_policy: never`.
+Until this PR is merged, use `refs/heads/cursor/ring-nas-recorder-088d.tar.gz` instead
+of `master`. In the app YAML use `image: ring-nas-recorder:latest` and
+`pull_policy: never`.
 
-### 4. Generate a refresh token (one time)
+### 3. Log in to Ring (one time, writes the token file)
 
 ```sh
-sudo docker run --rm -it ring-nas-recorder:latest auth
+sudo docker run --rm -it --user 568:568 --read-only --cap-drop ALL \
+  --security-opt no-new-privileges:true --tmpfs /tmp \
+  -v /mnt/tank/apps/ring-nas-recorder:/data \
+  ghcr.io/wakeupworld/ring-nas-recorder@sha256:<digest> auth
 ```
 
-Enter your Ring email, password and the 2FA code Ring sends you, then copy the long
-token it prints. After the first run, **Ring app > Control Center > Authorized Client
-Devices** shows `ring-nas-recorder`, which is how you revoke it later.
+Enter the Ring email and password (the password isn't echoed), then the 2FA code.
+The token goes straight to `/mnt/tank/apps/ring-nas-recorder/refresh-token` (mode
+0600, owner `apps`). The command prints only a short fingerprint, never the token, and
+the password is not stored. Afterwards, **Ring app > Control Center > Authorized
+Client Devices** shows `ring-nas-recorder`.
 
-### 5. Install the app via YAML
+### 4. Install the app via YAML
 
-1. Go to **Apps > Discover Apps**, click the **⋮** menu at the top right, and
-   choose **Install via YAML**.
+1. Go to **Apps > Discover Apps**, click the **⋮** menu at the top right, and choose
+   **Install via YAML**.
 2. Name it `ring-nas-recorder` and paste
-   [`deploy/truenas-app.yaml`](deploy/truenas-app.yaml):
+   [`deploy/truenas-app.yaml`](deploy/truenas-app.yaml).
+3. Set the image digest, the two `/mnt/...` paths (`/data` must be the
+   `tank/apps/ring-nas-recorder` dataset from step 1) and `TZ`, then click **Save**.
 
-   ```yaml
-   services:
-     ring-nas-recorder:
-       image: ring-nas-recorder:latest
-       pull_policy: never
-       restart: unless-stopped
-       environment:
-         TZ: America/New_York
-         PUID: "568"
-         PGID: "568"
-         RING_REFRESH_TOKEN: "paste-token-from-auth-step"
-         TRIGGERS: motion,ding
-         CLIP_SECONDS: "45"
-         MAX_CONCURRENT_STREAMS: "2"
-         RETENTION_DAYS: "30"
-       volumes:
-         - /mnt/tank/apps/ring-nas-recorder/data:/data
-         - /mnt/tank/media/ring:/recordings
-   ```
+The YAML contains no secrets and already applies the hardening: `user: 568:568`,
+`read_only`, a `noexec` tmpfs `/tmp`, `cap_drop: [ALL]`, `no-new-privileges`, CPU,
+memory and PID limits, no `ports:`, a dedicated bridge network, and log rotation.
+`restart: unless-stopped` brings it back after crashes and reboots. The image
+healthcheck marks the app unhealthy if the heartbeat stalls for 3 minutes.
 
-3. Fix the `/mnt/...` paths, `TZ`, and the token, then click **Save**.
-
-`restart: unless-stopped` brings the recorder back after crashes and NAS reboots
-(TrueNAS restarts apps when the Docker service starts). The image healthcheck marks
-the app unhealthy if the heartbeat stops for 3 minutes.
-
-### 6. Verify
+### 5. Verify
 
 Open **Apps > Installed > ring-nas-recorder > Logs**. You should see:
 
 ```
-INFO  Using refresh token from RING_REFRESH_TOKEN (first run)
+INFO  Using refresh token from /data/refresh-token
 INFO  Authenticating with Ring and discovering cameras...
 INFO  Refresh token rotated and saved
 INFO  Camera "Front Door" (id 123456) battery, triggers: motion+ding
 INFO  Listening for events: 45s clips -> /recordings
 ```
 
-Walk in front of a camera. About a minute later a file appears in
-`/mnt/tank/media/ring/<Camera>/<date>/`. From then on, `data/refresh-token` holds the
-live token. You can blank out `RING_REFRESH_TOKEN` with **Edit** if you prefer not to
-keep the old token in the app config.
+Walk in front of a camera. A clip appears under `/mnt/tank/media/ring/<Camera>/<date>/`
+shortly after.
 
 ### Updating
 
-Rebuild the image (step 3), then open the app and choose **Edit > Save** (or Stop,
-then Start) so the container is recreated from the new image. The token and state in
-`/data` are kept.
+Change the digest in the app's YAML (**Edit**) to the newly published one and Save.
+If you build locally, rebuild and then **Edit > Save** to recreate the container. The
+token in `/data` is kept.
 
 ### Optional: write the clips to a Synology share instead
 
-The container can run on TrueNAS while the files land on a Synology NAS. Swap the
-`/recordings` bind mount for a Docker NFS or SMB volume in the YAML.
+The container can run on TrueNAS while the files land on a Synology. Swap the
+`/recordings` bind mount for a Docker NFS volume. Keep `/data` on TrueNAS.
 
-**NFS (recommended).** On the Synology, enable NFS under **Control Panel > File
-Services > NFS**. Then open the shared folder's **Edit > NFS Permissions** and add the
-TrueNAS IP with Read/Write and *Squash: Map all users to admin*. If you'd rather not
-squash, make the folder writable by UID 568 instead.
+On the Synology:
+1. Enable NFS under **Control Panel > File Services > NFS**.
+2. Open the shared folder's **Edit > NFS Permissions** and add the TrueNAS IP
+   **only**, with Read/Write. For Squash, choose *Map all users to admin*, or use
+   *No mapping* and make the folder writable by UID 568.
 
 ```yaml
-services:
-  ring-nas-recorder:
-    # ...same as above, but:
     volumes:
-      - /mnt/tank/apps/ring-nas-recorder/data:/data
+      - /mnt/tank/apps/ring-nas-recorder:/data
       - synology-ring:/recordings
 volumes:
   synology-ring:
     driver: local
     driver_opts:
       type: nfs
-      o: addr=192.168.1.20,nfsvers=4.1,rw,soft
+      o: addr=192.168.1.20,nfsvers=4.1,rw,soft,nosuid,nodev,noexec
       device: ":/volume1/ring"
 ```
 
-**SMB.** Create a DSM user with write access to the share, then:
+Avoid SMB (`type: cifs`) volumes here: they require the share password in plain text
+in the app YAML. To run the container **on** a Synology instead, create a project
+under **Container Manager > Project > Create** with [`docker-compose.yml`](docker-compose.yml).
 
-```yaml
-volumes:
-  synology-ring:
-    driver: local
-    driver_opts:
-      type: cifs
-      o: "username=ringrec,password=CHANGE_ME,uid=568,gid=568,vers=3.0,file_mode=0664,dir_mode=0775"
-      device: "//192.168.1.20/ring"
+---
+
+## Security
+
+### What the container does and doesn't do
+
+| Area | Measure |
+| --- | --- |
+| Secrets | No token in the YAML or environment. The `auth` command writes it to the 0700 data dataset as a 0600 file, owned by 568. Rotations are written atomically. Tokens, passwords and bearer values are redacted from all logs, including `ring-client-api` debug output and error stacks. A bootstrap token can also come from a Docker secret file. |
+| Privileges | Runs as 568:568 (`USER` in the image and `user:` in the YAML). Read-only root filesystem, `noexec`/`nosuid` tmpfs for `/tmp`, `cap_drop: ALL`, `no-new-privileges`, PID, memory and CPU limits. |
+| Network | No listening ports and no `ports:` mapping. Only outbound connections to Ring and Google push. |
+| Image | Multi-stage build on `node:22-alpine3.24` pinned by digest. ffmpeg, tini and tzdata come from Alpine with pinned versions. Dependency install scripts are disabled (`npm ci --omit=dev --ignore-scripts`). npm, npx, corepack and yarn are removed from the runtime image. |
+| Supply chain | Exact versions in `package.json` plus `package-lock.json`. CI (`.github/workflows/ring-nas-recorder.yml`, all actions pinned by commit SHA) runs the tests, an `npm audit` gate, a locked-down smoke test and a Trivy scan that fails on HIGH/CRITICAL findings. It publishes to GHCR with SBOM and provenance and signs with cosign. |
+| Data | Camera names are sanitized (no `/`, `\`, `..`, control characters or leading dots, at most 80 characters), and every output path is checked to stay inside `/recordings`. Files are 0640 and folders 0750. Retention and the free-space floor bound disk use. |
+
+Accepted dependency finding: `ip@2.0.1` (CVE-2024-29415 / GHSA-2p57-rm9w-gvfp, no
+fixed release) comes in through `werift`, the WebRTC stack used by `ring-client-api`.
+The bug is in `ip.isPublic()`/`isPrivate()`, which werift never calls. It only uses
+`isV4`, `isV6`, `toBuffer`, `toString` and `isLoopback`. The finding is allowlisted by
+ID in `scripts/audit-check.mjs` and `.trivyignore`, so any *other* advisory still
+fails CI.
+
+### Ring account
+
+- **2FA**: Ring requires 2FA for logins. Prefer an authenticator app over SMS.
+- **Dedicated shared user (recommended)**: create a separate Ring account (e.g.
+  `ring-nas@yourdomain`) and invite it from the owner account under **Ring app >
+  Control Center > Shared Users**. Log the recorder in with that account. If the
+  token leaks, the attacker gets a shared user's access (live view, event list), not
+  owner rights such as changing settings, removing devices or managing billing.
+  Enable Motion Alerts for each camera in the *shared* account's app, because
+  notifications follow that account's settings. If you have Ring Alarm, shared users
+  can typically arm and disarm it; weigh that before sharing alarm access.
+- **Revocation**: remove `ring-nas-recorder` under **Control Center > Authorized
+  Client Devices**, then delete `/mnt/tank/apps/ring-nas-recorder/refresh-token`.
+  Changing the Ring password also signs out all clients.
+- Treat the data dataset like a password store: keep it out of SMB/NFS shares and
+  out of replication targets you don't control.
+
+### TrueNAS permissions
+
+- `tank/apps/ring-nas-recorder` should be POSIX, owned `apps:apps`, mode 0700, and
+  **never shared**.
+- `tank/media/ring` gets `apps` with Modify, admins with Full Control, and viewers
+  with Read only. Don't grant `everyone@` or `other` any access.
+- Put a quota on the recordings dataset. Snapshots (Data Protection > Periodic
+  Snapshot Tasks) protect clips against accidental or malicious deletion over SMB.
+
+### SMB access for viewers
+
+1. Create a group `ring-viewers` (**Credentials > Groups**) and add the people who may
+   watch clips.
+2. On `tank/media/ring` > **Edit ACL**, add Group `ring-viewers` with **Read**,
+   inherited (Apply recursively).
+3. Create the share under **Shares > SMB > Add**, path `/mnt/tank/media/ring`. Under
+   **Advanced Options** tick **Export Read Only**. If admins need to delete clips,
+   create a second, admin-only share without read-only instead.
+
+### Network
+
+The recorder only needs outbound internet:
+
+- Ring API and auth over HTTPS (`oauth.ring.com`, `api.ring.com`, `app.ring.com`,
+  `*.rings.solutions`)
+- Google Firebase Cloud Messaging for push notifications (`mtalk.google.com`
+  TCP 5228-5230, `*.googleapis.com`, `android.clients.google.com`)
+- WebRTC media over UDP and TCP to Ring media servers on changing cloud IPs
+
+A strict domain or IP allowlist therefore tends to break live streams. The useful
+restriction is **blocking the container from your LAN**. The app YAML pins its
+network to `172.30.250.0/24` for that purpose. TrueNAS 25.10 has no per-app firewall
+UI, so add a post-init script under **System > Advanced Settings > Init/Shutdown
+Scripts > Add**, with Type *Command*, When *Post Init*:
+
+```sh
+iptables -N RING-EGRESS 2>/dev/null; iptables -F RING-EGRESS; \
+iptables -A RING-EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN; \
+iptables -A RING-EGRESS -d 10.0.0.0/8 -j DROP; \
+iptables -A RING-EGRESS -d 172.16.0.0/12 -j DROP; \
+iptables -A RING-EGRESS -d 192.168.0.0/16 -j DROP; \
+iptables -D DOCKER-USER -s 172.30.250.0/24 -j RING-EGRESS 2>/dev/null; \
+iptables -I DOCKER-USER -s 172.30.250.0/24 -j RING-EGRESS
 ```
 
-Keep `/data` on a local TrueNAS dataset either way, so the token survives if the
-Synology is offline. If the share is unreachable at startup, the container fails and
-`restart: unless-stopped` keeps retrying.
-
-To run the container **on** a Synology instead, use **Container Manager > Project >
-Create** with [`docker-compose.yml`](docker-compose.yml). Set `PUID`/`PGID` to your
-DSM user's ids (run `id <user>` over SSH) and bind-mount a shared folder such as
-`/volume1/ring:/recordings`.
+Docker's embedded DNS resolves names through the host, so DNS keeps working. Check
+the rules with `sudo iptables -L DOCKER-USER -n` after starting the app, because
+Docker recreates its chains on restart, which is why this runs post-init. If your
+router supports VLANs or per-host rules, blocking the NAS's app traffic to the LAN
+there is equivalent and survives TrueNAS upgrades.
 
 ---
 
 ## Any other Docker host
 
 ```sh
-cp .env.example .env            # add RING_REFRESH_TOKEN, TZ, PUID/PGID
+cp .env.example .env               # TZ and options only, no secrets
+mkdir -p data recordings && sudo chown 568:568 data recordings && chmod 700 data
 docker compose build
-docker compose run --rm ring-nas-recorder auth   # if you still need a token
-docker compose up -d
-docker compose logs -f
+docker compose run --rm ring-nas-recorder auth
+docker compose up -d && docker compose logs -f
 ```
 
-## Testing without a Ring account
+`docker-compose.yml` has the same hardening as the TrueNAS YAML, plus a commented-out
+`secrets:` block if you'd rather bootstrap from a 0600 token file.
+
+## Development and testing
 
 ```sh
+npm ci --ignore-scripts && npm test && npm run audit
 docker build -t ring-nas-recorder .
 mkdir -p rec && sudo chown 568:568 rec
-docker run --rm -e MOCK=1 -e RING_REFRESH_TOKEN=x -e CLIP_SECONDS=8 \
-  -e MOCK_EVENT_INTERVAL_SECONDS=5 -e EXIT_AFTER_SECONDS=40 \
-  -v "$PWD/rec:/recordings" ring-nas-recorder
+docker run --rm --read-only --cap-drop ALL --tmpfs /tmp -e MOCK=1 \
+  -e RING_REFRESH_TOKEN=x -e CLIP_SECONDS=8 -e MOCK_EVENT_INTERVAL_SECONDS=5 \
+  -e EXIT_AFTER_SECONDS=40 -v "$PWD/rec:/recordings" ring-nas-recorder
 ```
 
 Mock mode simulates a doorbell and a camera. It runs the real recording, folder
-layout, token-persistence and permission code paths, with ffmpeg test video standing
-in for the Ring stream. Unit tests run with `npm test`.
+layout, token persistence and permission code paths, with ffmpeg test video standing
+in for the Ring stream.
 
 ## Alternatives considered
 
