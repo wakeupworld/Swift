@@ -58,14 +58,15 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Smoke test (locked-down mock run)
         run: |
-          mkdir -p /tmp/rnr/data /tmp/rnr/rec && sudo chown -R 568:568 /tmp/rnr
+          mkdir -p /tmp/rnr/data /tmp/rnr/rec
+          sudo chown 568:568 /tmp/rnr/data /tmp/rnr/rec
           echo mock-token-for-ci > /tmp/rnr/token && chmod 644 /tmp/rnr/token
           docker run --rm --user 568:568 --read-only --cap-drop ALL \
             --security-opt no-new-privileges:true --tmpfs /tmp:size=64m,noexec,nosuid,nodev \
             -v /tmp/rnr/data:/data -v /tmp/rnr/rec:/recordings \
             -v /tmp/rnr/token:/run/secrets/ring_refresh_token:ro \
             -e MOCK=1 -e CLIP_SECONDS=5 -e MOCK_EVENT_INTERVAL_SECONDS=3 -e EXIT_AFTER_SECONDS=15 \
-            ring-nas-recorder:ci | tee /tmp/rnr/log.txt
+            ring-nas-recorder:ci 2>&1 | tee /tmp/rnr/log.txt
           test "$(sudo find /tmp/rnr/rec -name '*.mp4' | wc -l)" -ge 1
           test "$(sudo stat -c %a /tmp/rnr/data/refresh-token)" = 600
           ! grep -q mock-token-for-ci /tmp/rnr/log.txt
